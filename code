@@ -1,0 +1,123 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, when, udf
+from pyspark.sql.types import IntegerType, FloatType
+import time
+import random
+
+# Initialize Spark Session with optimization configurations
+spark = SparkSession.builder \
+    .appName("DataPipelineOptimization") \
+    .config("spark.sql.shuffle.partitions", "8") \  # Optimal partition count for local execution
+    .config("spark.sql.autoBroadcastJoinThreshold", "10485760") \  # 10MB broadcast threshold
+    .config("spark.executor.memory", "2g") \
+    .getOrCreate()
+
+# Sample data generation function
+def generate_sample_data(spark, num_records=1000000):
+    data = []
+    for i in range(num_records):
+        data.append((
+            i,  # id
+            f"user_{i}",  # username
+            random.choice(["US", "UK", "CA", "AU", "DE"]),  # country
+            random.randint(18, 80),  # age
+            random.choice(["M", "F", "O"]),  # gender
+            round(random.uniform(10, 500), 2),  # purchase_amount
+            random.choice(["electronics", "clothing", "food", "books", "other"])  # category
+        ))
+    
+    columns = ["id", "username", "country", "age", "gender", "purchase_amount", "category"]
+    return spark.createDataFrame(data, schema=columns)
+
+# Generate sample datasets
+print("Generating sample data...")
+transactions_df = generate_sample_data(spark)
+users_df = generate_sample_data(spark, num_records=1000).select("id", "username", "country", "age", "gender")
+
+# Unoptimized pipeline
+def unoptimized_pipeline():
+    print("\nRunning UNOPTIMIZED pipeline...")
+    start_time = time.time()
+    
+    # Inefficient transformations
+    result = transactions_df \
+        .join(users_df, "id", "inner") \  # Shuffle join without broadcast
+        .filter(col("country") == "US") \
+        .groupBy("category", "gender") \
+        .agg({"purchase_amount": "avg", "id": "count"}) \
+        .orderBy("category")
+    
+    result.show(10)
+    print(f"Unoptimized execution time: {time.time() - start_time:.2f} seconds")
+    return result
+
+# Optimized pipeline
+def optimized_pipeline():
+    print("\nRunning OPTIMIZED pipeline...")
+    start_time = time.time()
+    
+    # Optimization techniques applied:
+    
+    # 1. Cache frequently used DataFrame
+    filtered_transactions = transactions_df.filter(col("country") == "US").cache()
+    
+    # 2. Broadcast the smaller users DataFrame
+    from pyspark.sql.functions import broadcast
+    joined_df = filtered_transactions.join(broadcast(users_df), "id", "inner")
+    
+    # 3. Use column pruning
+    selected_cols = joined_df.select("category", "gender", "purchase_amount")
+    
+    # 4. Use efficient aggregations with aliases
+    from pyspark.sql.functions import avg, count
+    result = selected_cols.groupBy("category", "gender") \
+        .agg(
+            avg("purchase_amount").alias("avg_purchase"),
+            count("*").alias("transaction_count")
+        ) \
+        .orderBy("category")
+    
+    result.show(10)
+    print(f"Optimized execution time: {time.time() - start_time:.2f} seconds")
+    
+    # 5. Unpersist cached data
+    filtered_transactions.unpersist()
+    return result
+
+# Additional optimization: Partitioning strategy
+def partitioned_pipeline():
+    print("\nRunning PARTITIONED pipeline...")
+    
+    # Repartition data by category for better locality
+    partitioned_df = transactions_df.repartition(10, "category")
+    
+    start_time = time.time()
+    
+    # Filter after partitioning to take advantage of partition pruning
+    result = partitioned_df.filter(col("country") == "US") \
+        .groupBy("category", "gender") \
+        .agg({"purchase_amount": "avg", "id": "count"}) \
+        .orderBy("category")
+    
+    result.show(10)
+    print(f"Partitioned execution time: {time.time() - start_time:.2f} seconds")
+    return result
+
+# Run all pipelines
+unoptimized_result = unoptimized_pipeline()
+optimized_result = optimized_pipeline()
+partitioned_result = partitioned_pipeline()
+
+# Explain plans for comparison
+print("\nUNOPTIMIZED Execution Plan:")
+unoptimized_result.explain()
+
+print("\nOPTIMIZED Execution Plan:")
+optimized_result.explain()
+
+print("\nPARTITIONED Execution Plan:")
+partitioned_result.explain()
+
+# Clean up
+spark.stop()
+print("Pipeline optimization simulation completed.")
